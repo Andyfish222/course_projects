@@ -1,0 +1,1897 @@
+---
+title: "TSA_final_4111021001"
+author: "財金三 4111021001 王智宏 (Wang Chih Hung)"
+date: "2025-06-15"
+freeze: auto
+output:
+  html_document: 
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(ks)
+library(reshape2)
+library(foreach)
+library(kableExtra)
+library(spNetwork)
+library(randtests)
+library(TSA)
+library(tseries)
+library(forecast)
+library(ggplot2)
+library(plotly)
+library(hrbrthemes)
+library(odbc)
+library(dplyr)
+library(dtw)
+```
+
+# 一、2382廣達 時間序列分析
+
+### 期間:20100101\~20250430
+
+```{r}
+X2382 <- read_excel("C:\\Users\\Andyfish\\Desktop\\2382.xlsx") #load data 
+P_t = X2382$close
+r_t = 100*diff(log(P_t)) #複合報酬率 %
+```
+
+## (a)用 $P_t$作時間序列分析
+
+### 1.觀察$P_t$走勢圖:
+
+從走勢圖可觀察出廣達股價初期呈現震盪整理，而後AI浪潮爆發後波動加劇，整體呈現上升趨勢。且收盤價資料非平穩，可能需要進行差分處理後再配適模型。
+
+```{r}
+X2382$ymd <- as.Date(X2382$ymd,format = "%Y%m%d")
+data_closep <- data.frame(close = P_t, date = X2382$ymd)
+p <- data_closep %>% #library(dplyr)
+  ggplot( aes(x=date, y=P_t)) + #library(ggplot2)
+  geom_line(color="#69b3a2") +
+  ylab("2382") +
+  theme_ipsum() #library(hrbrthemes)
+
+p <- ggplotly(p) #library(plotly)
+p 
+print(adf.test(P_t))
+print(pp.test(P_t))
+print(kpss.test(P_t))
+```
+
+-   可以看到，在ADF($H_0: 非平穩，p=0.9086$ ,not reject)、PP($H_0: 非平穩，p=0.8026$ ,not reject)、KPSS檢定中($H_0: 平穩，p=0.01$ ,rejected)，價格為非平穩序列，需進行差分達成平穩後，以便後續統計分析
+
+### 2.觀察$P_t$的時間相依性
+
+(1)ACF(自相關函數)
+
+假設一個平穩隨機過程$Y_t$具有平均值$\mu$,變異數$\sigma^2$, 自共異變數函數$\gamma (\tau)$ ，自相關函數為 $\rho (\tau)$. 且$\rho (\tau) = \gamma (\tau) / \gamma (0) = \gamma (\tau) / \sigma^2.$，同時$\rho (0) = 1$。
+
+-   總體來說，所有 lag 都顯著，表示當前值與過去值高度相關
+-   ACF 緩慢遞減：可能為非恆定（non-stationary）的特徵
+
+```{r}
+acf(P_t)
+```
+
+(2)PACF(偏自相關函數)
+
+假設一$Y_t$的回歸，以 $Y_{t-1}, Y_{t-2}, \ldots, Y_{t-p}$做估計, $$
+\begin{eqnarray*}
+Y_t &=& \alpha_{01} + \alpha_{11} Y_{t-1} + e_t \\
+Y_t &=& \alpha_{02} + \alpha_{12} Y_{t-1} +\alpha_{22} Y_{t-2} + e_t \\
+Y_t &=& \alpha_{03} + \alpha_{13} Y_{t-1} +\alpha_{23} Y_{t-2} + \alpha_{33} Y_{t-3} + e_t \\
+\vdots &=& \cdots \\
+Y_t &=& \alpha_{0p} + \alpha_{1p} Y_{t-1} +\alpha_{23} Y_{t-2} + \alpha_{33} Y_{t-3} + \cdots + \alpha_{pp} Y_{t-p} + e_t
+\end{eqnarray*}
+$$ $\alpha_{11}, \alpha_{22}, \ldots, \alpha_{pp}$ 就是 $\{ Y_t \}$的偏自相關係數, i.e.,$PACF (k) = \alpha_{kk}$.
+
+-   偏自相關圖可能在第1個 lag 顯著很高，或許適合AR(1)模型。
+
+```{r}
+pacf(P_t)
+```
+
+### 3.模型估計
+
+(1)Autoregressive Moving Average(ARMA) Models
+
+一個包含p-order AR和q-order MA的模型就是ARMA(p,q).如下式: $$
+\begin{eqnarray*}
+\phi(B) Y_t = \pi(B) Z_t,
+\end{eqnarray*}
+$$ 其中 $\phi(B)$ 和 $\pi(B)$ 是 $p$-th 和 $q$-th order 的多項式，以$B$(落後運算子)表示.如下所示, $$
+\begin{eqnarray*}
+\phi(B) &=& 1 - \phi_1 B - \phi_2 B^2 - \cdots - \phi_p B^p \\
+\pi (B) &=& 1 - \pi_1 B - \pi_2 B^2 - \cdots - \pi_q B^q.
+\end{eqnarray*}
+$$ 由 ARMA($p,q$) 模型產生的過程稱為 ARMA($p,q$) 過程，其穩態和可逆性質分別由 $\phi(z)$ 和 $\pi(z)$ 的根決定。
+
+(1-1)使用MLE估計ARMA(1,1),樣本:$P_t$
+
+```{r,include=TRUE}
+armacoeff <- function(x) {
+     l     = length(x)
+     param = c(mu=0, phi=0, theta=0)
+
+     SSE <- function(param) {
+         mu    = param[1]
+         phi   = param[2]
+         theta = param[3]
+
+         res    = vector()
+         res[1] = 0
+         for(i in (2:l)) {
+             res[i] = x[i] - (mu+x[i-1]*phi) - (res[i-1]*theta)
+         }
+
+         return(sum(res*res))
+    }
+
+    return(nlminb(objective=SSE, start= param))
+}
+
+results <- armacoeff(P_t)
+print(results)
+```
+
+(1-2)使用套件估計ARMA(1,1),樣本:$P_t$
+
+```{r}
+P_t.arma <- arma(P_t, order=c(1,1))
+print(summary(P_t.arma))
+plot(P_t.arma)
+acf((P_t.arma$residuals),na.action=na.remove)
+pacf((P_t.arma$residuals),na.action=na.remove)
+P_t.arma <- arima(P_t, order=c(1,0,1))
+plot(P_t.arma)
+cat("BIC: ",BIC(P_t.arma))
+```
+
+-   可以看出$\phi_1$幾乎為一，前一期對當期效果影響巨大
+-   在inverse AR roots可以看到，收盤價未進行差分處理，存在單根，為非恆定，可能無法用於預測未來
+-   inverse MA root 無單根且在單位圓內，MA(1) 部分可逆，可轉換為對應的 AR(∞) 結構
+-   殘差的ACF/PACF皆有多個顯著的lag，代表模型並沒有捕捉全部的時間相依特徵，需改進
+
+(2)使用套件估計ARIMA(1,1,1),樣本:$P_t$
+
+```{r}
+P_t.arima = arima(P_t, order=c(1,1,1))
+print(summary(P_t.arima))
+plot(P_t.arima)
+acf(residuals(P_t.arima),na.action=na.remove)
+pacf(residuals(P_t.arima),na.action=na.remove)
+cat(P_t.arima$aic)
+cat("\nBIC: ",BIC(P_t.arima))
+```
+
+-   在inverse AR roots可以看到，經由I(1)差分後，位於單位圓內，顯示恆定性。
+-   ARIMA模型比ARMA模型的AIC及SIC(BIC)略低，(18856.42/18888.77 vs. 18846.69/18867.39)，ARIMA模型對$P_t$較佳
+-   但在殘差的ACF/PACF皆有多個顯著的lag，代表模型並沒有捕捉全部的時間相依特徵，需改進
+
+### 4.檢測殘差是否為white-noise
+
+#### 理論:
+
+為檢查時間序列是否來自白噪音隨機過程，首先研究$H_0:\rho(1)=0,$自相關檢驗。如果$\{ y_t \}$是一個獨立同分布的序列，且 $E(y_t^2) < \infty$，假設在T夠大的情況下: $$
+\begin{eqnarray*}
+\sqrt{T} \hat\rho_T (1) &=& \sqrt{T}\, \frac{\sum_{t=2}^T (y_t - {\bar y}_{T-1})(y_{t-1} - {\bar y}_{T-1})}
+                      {\sum_{t=2}^T (y_{t-1} - {\bar y}_{T-1})^2} \\
+&\to& N(0, 1), 
+\end{eqnarray*}
+$$
+
+檢驗 $H_0 : \rho (1) = 0$ 和 $H_a : \rho(1) \neq 0$,檢定統計量在null為真的情況下為 $$
+\begin{eqnarray*}
+\sqrt{T} \hat\rho_T (1) \to^p N(0, 1).
+\end{eqnarray*}
+$$ 總而言之, 檢驗 $H_0 : \rho (l) = 0$ 和 $H_a : \rho(l) \neq 0$,檢定統計量在null為真的情況下為 $$
+\begin{eqnarray*}
+\sqrt{T} \hat\rho_T (l) \to^p N(0, 1),
+\end{eqnarray*}
+$$ 其中 $$
+\begin{eqnarray*}
+\hat\rho_T (l) = \frac{\sum_{t=l+1}^T (y_t - {\bar y}_{T-l})(y_{t-l} - {\bar y}_{T-l})}
+                      {\sum_{t=l+1}^T (y_{t-l} - {\bar y}_{T-l})^2}.
+\end{eqnarray*}
+$$
+
+#### Portmanteau Test:
+
+Box and Pierce\~(1970) 提出 portmanteau statistic $$
+\begin{eqnarray*}
+Q^* (m) = T \sum_{l=1}^m \hat\rho_T (l)^2
+\end{eqnarray*}
+$$ 來檢驗 $H_0: \rho(1) = \cdots = \rho(m) =0$與對立假說 $H_a : \rho (i) \neq 0, \forall i$. 在null為真的情況下, $Q^* (m) \to \chi^2 (m)$ 當 $T \to \infty$.
+
+Ljung and Box (1978)調整了 $Q^* (m)$ 統計量以增強對有限樣本的測試能力: $$
+\begin{eqnarray*}
+Q(m) = T(T + 2) \sum_{l=1}^m \frac{\hat\rho_T (l)^2}{T-l}.
+\end{eqnarray*}
+$$
+
+(1)ARMA(1,1) for $P_t$
+
+-   經測試，p-value極小(2.2e-16)，拒絕$H_0$，顯示出序列仍有顯著自相關性，符合上面提到的ACF/PACF圖所觀察到的情形。
+-   標準化殘差觀察到後面期數有持續高波動的區塊（表示波動不穩定），資料可能具有變異數不穩定性，且模型不穩定
+
+```{r}
+print(LB.test(P_t.arma,lag=24,type = "Ljung-Box"))
+print(LB.test(P_t.arma, lag=24, type="Box-Pierce"))
+print(P_t.arma$aic)
+plot(rstandard(P_t.arma),ylab='Standardized residuals',type='l')
+abline(h=0)
+abline(h=2)
+abline(h=-2)
+```
+
+(2)ARIMA(1,1,1) for $P_t$
+
+-   經測試，同樣p-value極小(2.2e-16)，拒絕$H_0$，顯示出序列仍有顯著自相關性。
+-   標準化殘差也觀察到後面期數有持續高波動的區塊，模型不穩定
+
+```{r}
+print(LB.test(P_t.arima,lag=24,type = "Ljung-Box"))
+print(LB.test(P_t.arima, lag=24, type="Box-Pierce"))
+print(P_t.arima$aic)
+plot(rstandard(P_t.arima),ylab='Standardized residuals',type='l')
+abline(h=0)
+abline(h=2)
+abline(h=-2)
+```
+
+## (b)樣本外預測，for $P_t$
+
+-   收盤價無法直接使用ARMA模型作時間序列預測，因為收盤價具有趨勢，因此平均數和變異數會因時間改變，導致序列不平穩。且根據弱恆定(Weakly stationary)條件: 需要Constant mean(一致的均值)、Constant variance(一致的變異數)、及Autocovariances(自共變異數)只和$\tau$(lag)有關而和t無關。
+
+-   若想使用ARMA模型，須對收盤價進行差分或其他運算方式達成穩態後才能使用。
+
+## (c)用 $r_t$作時間序列分析
+
+### 1.觀察$r_t$走勢圖:
+
+-   報酬率呈現類似於隨機波動，均值近似0(cross mean likely)，可能具恆定特性。
+
+-   ADF測試也顯示出$r_t$為恆定(p-value = 0.01)。
+
+```{r}
+n <- length(P_t)
+data_Ret <- data.frame(ret = r_t, date = X2382$ymd[2:n])
+p1 <- data_Ret %>%
+  ggplot( aes(x=date, y=ret)) +
+  #  geom_area(fill="#69b3a2", alpha=5) +
+  geom_line(color="#69b3a2") +
+  ylab("2382") +
+  theme_ipsum()
+
+p1 <- ggplotly(p1)
+p1
+print(adf.test(r_t))
+print(pp.test(r_t))
+print(kpss.test(r_t))
+```
+
+-   可以看到，在ADF($H_0: 非平穩，p=0.01$ ,rejected)、PP($H_0: 非平穩，p=0.01$ ,rejected)、KPSS檢定中($H_0: 平穩，p=0.1$ ,not reject)，價格為平穩序列
+
+### 2.報酬率機率密度函數的核密度估計:
+
+(1)給定樣本, $\{ x_1, x_2, \ldots, x_n \}$, 在 $x$的核密度估計: $$
+\begin{eqnarray*}
+\hat{f} (x) &=& \frac{1}{n} \sum_{i=1}^n K \left(\frac{x_i - x}{h}\right),
+\end{eqnarray*}
+$$ $K$:核密度估計函數, $h$:帶寬
+
+$r_t$機率密度函數估計:
+
+-   KDE呈現厚尾分布，明顯偏離常態分布
+
+```{r}
+h_T <- hpi(r_t) #library(ks)
+fhat <- kde(r_t, xmin=-10, xmax=10, gridsize=1000) 
+plot(fhat)
+hist(r_t)
+```
+
+(2)偏、峰態:
+
+令$\sigma_X$為隨機變數$X$的標準差:
+
+-   偏態可以看出略微左偏(-0.1574782 )，峰態比常態分布尖(4.849176 \> 0)。
+
+偏態(skewness): $$
+\begin{eqnarray*}
+\alpha_3 (X) = \frac{E[X-E(X)]^3}{\sigma_X^3} = E\left[\left(\frac{X-E(X)}{\sigma_X} \right)^3 \right],
+\end{eqnarray*}
+$$ 峰態(kurtosis) $$
+\begin{eqnarray*}
+\alpha_4 (X) = \frac{E[X-E(X)]^4}{\sigma_X^4} = E\left[\left(\frac{X-E(X)}{\sigma_X} \right)^4 \right].
+\end{eqnarray*}
+$$
+
+```{r}
+cat("Skewness",skewness(r_t),"\n")
+cat("Kurtosis",kurtosis(r_t))
+```
+
+### 3.觀察$r_t$的時間相依性
+
+(1)ACF(自相關函數)
+
+-   在lag=3,4,5顯著，可能代表延遲反應或週期性交易行為
+-   在lag=31顯著，可能代表每隔一個月左右的日曆期間，投資認會做再平衡，調整投資部位
+
+```{r}
+acf(r_t)
+```
+
+(2)PACF(偏自相關函數)
+
+-   類似上面的說明
+
+```{r}
+pacf(r_t)
+```
+
+### 4.模型估計
+
+(1)Autoregressive Moving Average(ARMA) Models
+
+(1-1)使用MLE估計ARMA(1,1),樣本:$r_t$
+
+```{r,include=TRUE}
+armacoeff <- function(x) {
+     l     = length(x)
+     param = c(mu=0, phi=0, theta=0)
+
+     SSE <- function(param) {
+         mu    = param[1]
+         phi   = param[2]
+         theta = param[3]
+
+         res    = vector()
+         res[1] = 0
+         for(i in (2:l)) {
+             res[i] = x[i] - (mu+x[i-1]*phi) - (res[i-1]*theta)
+         }
+
+         return(sum(res*res))
+    }
+
+    return(nlminb(objective=SSE, start= param))
+}
+
+results <- armacoeff(r_t)
+print(results)
+```
+
+(1-2)使用套件估計ARMA(1,1),樣本:$r_t$
+
+```{r}
+r_t.arma <- arma (r_t, order=c(1, 1))
+print(summary(r_t.arma))
+plot(r_t.arma)
+acf(residuals(r_t.arma),na.action=na.remove)
+pacf(residuals(r_t.arma),na.action=na.remove)
+r_t.arma <- arima (r_t, order=c(1,0, 1))
+cat("BIC: ",BIC(r_t.arma))
+```
+
+(2)使用套件估計ARIMA(1,1,1),樣本:$r_t$
+
+```{r}
+r_t.arima = arima(r_t, order=c(1,1,1))
+print(r_t.arima)
+cat("BIC: ",BIC(r_t.arima))
+```
+
+-   經配適，ARMA(1,1)和ARIMA(1,1,1)的AIC及SIC接近(15757.87/15783.07 vs. 15759.17/15779.86)，模型效果相近，可能因為$r_t$已經過差分。
+
+(3)使用auto arima配適最佳模型
+
+-   經配適得到最適模型應為ARMA(2,2)，AIC及BIC皆為目前最佳
+
+```{r}
+rt_auto_arima <- auto.arima(r_t)
+print(summary(rt_auto_arima))
+```
+
+### 5.檢測殘差是否為white-noise
+
+(1)AR(1) for $r_t$
+
+-   p-value仍小(0.018)，顯示殘差序列可能仍有自相關性，模型不足捕捉全部時間相依性。
+
+```{r}
+r_t.ar = arima(r_t, order=c(1,0,0))
+print(LB.test(r_t.ar,lag=24,type = "Ljung-Box"))
+print(LB.test(r_t.ar, lag=24, type="Box-Pierce"))
+print(r_t.ar$aic)
+plot(rstandard(r_t.ar),ylab='Standardized residuals',type='l')
+abline(h=0)
+abline(h=2)
+abline(h=-2)
+```
+
+(2)MA(1) for $r_t$
+
+-   p-value仍小(0.019)，顯示殘差序列可能仍有自相關性，模型不足捕捉全部時間相依性。
+
+```{r}
+r_t.ma = arima(r_t, order=c(0,0,1))
+print(LB.test(r_t.ma,lag=24,type = "Ljung-Box"))
+print(LB.test(r_t.ma, lag=24, type="Box-Pierce"))
+print(r_t.ma$aic)
+plot(rstandard(r_t.ma),ylab='Standardized residuals',type='l')
+abline(h=0)
+abline(h=2)
+abline(h=-2)
+```
+
+(3)ARMA(1,1) for $r_t$
+
+-   p-value仍小(0.014)，顯示殘差序列可能仍有自相關性，模型不足捕捉全部時間相依性。
+
+```{r}
+print(LB.test(r_t.arma,lag=24,type = "Ljung-Box"))
+print(LB.test(r_t.arma, lag=24, type="Box-Pierce"))
+print(r_t.arma$aic)
+plot(rstandard(r_t.arma),ylab='Standardized residuals',type='l')
+abline(h=0)
+abline(h=2)
+abline(h=-2)
+```
+
+(4)ARIMA(1,1,1) for $r_t$
+
+-   p-value仍小(0.013)，顯示殘差序列可能仍有自相關性，模型不足捕捉全部時間相依性。
+
+```{r}
+print(LB.test(r_t.arima,lag=24,type = "Ljung-Box"))
+print(LB.test(r_t.arima, lag=24, type="Box-Pierce"))
+print(r_t.arima$aic)
+plot(rstandard(r_t.arima),ylab='Standardized residuals',type='l')
+abline(h=0)
+abline(h=2)
+abline(h=-2)
+```
+
+-   從上面結果來看，AR(1)、MA(1)、ARMA(1,1)、ARIMA(1,1,1)皆無法完整捕捉序列中的時間相依性，需要更複雜的模型。
+
+5.ARMA(2,2) for $r_t$
+
+-   p-value(0.61\>0.5)，顯示殘差序列可能可能較無自相關性，模型較能捕捉時間相依性
+-   AIC顯示出此模型最佳，可作為後續分析GARCH模型依據
+
+```{r}
+print(LB.test(rt_auto_arima,lag=24,type = "Ljung-Box"))
+print(LB.test(rt_auto_arima, lag=24, type="Box-Pierce"))
+print(rt_auto_arima$aic)
+plot(rstandard(rt_auto_arima),ylab='Standardized residuals',type='l')
+abline(h=0)
+abline(h=2)
+abline(h=-2)
+```
+
+```{r}
+#檢測殘差常態性
+qqnorm(rt_auto_arima$residuals)
+qqline(rt_auto_arima$residuals)
+```
+
+-   由圖可以看出，殘差明顯後尾，偏離常態分佈，需要進一步修正模型以校正殘差
+
+## (d)樣本外預測，for $r_t$，使用ARMA(1,1)，以Moving window方式預測
+
+```{r}
+library(foreach)
+library(doParallel)
+num_cores <- parallel::detectCores() - 1
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+forecasts = data.frame()
+w_size = floor(length(r_t)*0.9)
+n_windows = length(r_t) - w_size
+
+#  Rolling (Moving) Window Loop(平行運算版)
+forecasts = foreach(i = 1:n_windows, .combine = rbind, .packages = c("forecast")) %dopar% {
+  r_t_in = r_t[i:(w_size + i - 1)]
+
+  tryCatch({
+    f1 = forecast(Arima(r_t_in, order = c(1, 0, 1)), h = 1)$mean
+    f2 = r_t[w_size + i - 1]  # Random walk baseline
+    
+    # 顯示目前的預測結果
+    # cat(sprintf("Step %d: f1 = %.5f, f2 = %.5f\n", i, f1, f2))
+    
+    return(c(f1, f2))
+  }, error = function(e) {
+    cat(sprintf("Step %d: error - %s\n", i, e$message))
+    return(c(NA, NA))
+  })
+}
+stopCluster(cl)
+registerDoSEQ()
+```
+
+```{r}
+df_f = data.frame("date"=as.Date(X2382$ymd[(w_size+2):n]), "ARMA11" = forecasts[,1], "RandomWalk" = forecasts[,2])
+m_close = matrix(0,n_windows,2)
+a=0
+for (a in 1:n_windows)
+{
+  if (a==1){
+    m_close[a,1] = P_t[n - n_windows]*(1+df_f[a,"ARMA11"]/100)
+    m_close[a,2] = P_t[n - n_windows]*(1+df_f[a,"RandomWalk"]/100)
+  }else{
+    m_close[a,1] = m_close[a-1,1]*(1+df_f[a,"ARMA11"]/100)
+    m_close[a,2] = m_close[a-1,2]*(1+df_f[a,"RandomWalk"]/100)
+  }
+}
+df_f = cbind(df_f,m_close)
+
+df_long <- melt(df_f[,c(1,4,5)], id.vars = "date", variable.name = "Series", value.name = "Value")
+
+# 畫圖，比較實際股價與預測股價
+p2 <- df_long %>%
+  ggplot( aes(x = date, y = Value, color = Series, linetype = Series)) +
+  geom_line(size = 1) +
+  labs(title = "Forecasts vs RWF Returns(Converted to price)",
+       x = "Date", y = "Close Price") +
+  theme_minimal()
+
+p2 <- ggplotly(p2)
+p2
+```
+
+-   在預測報酬率轉換為預測股價後(1為預測，2為實際價格)，相較於前些年度，近年波動較大，預測可能會失準，導致預測殘差大。
+
+## (e)評估預測值
+
+```{r}
+e1 <- r_t[(w_size+1):(n-1)] - forecasts[,1]
+e2 <- r_t[(w_size+1):(n-1)] - forecasts[,2]
+df_err = data.frame("date"=as.Date(X2382$ymd[(w_size+2):n]), "ARMA11" = e1, "RandomWalk" = e2)
+mdf = melt(df_err,id.vars = "date")
+
+# ggplot(data = mdf) + geom_line(aes(x = date, y = value, linetype = variable, color = variable))
+
+p3 <- mdf %>%
+  ggplot( ) +
+  geom_line(aes(x = date, y = value, linetype = variable, color = variable)) +
+  labs(title = "Forecasts vs RWF Returns",
+       x = "Date", y = "Residual") +
+  theme_minimal()
+
+p3 <- ggplotly(p3)
+p3
+
+cat("MSE_ARMA11:" , mean(e1^2),"\n")
+cat("MSE_randomwalk:" , mean(e2^2),"\n")
+cat("MAE_ARMA11:" , mean(abs(e1)),"\n")
+cat("MAE_randomwalk:" , mean(abs(e2)))
+
+```
+
+-   由評估結果可知，雖然ARMA(1,1)模型預測能力有限，但仍比隨機漫步的情況要好上不少。
+-   MSE:快差一倍，MAE:少1/3
+
+# 二、變異數異質性與GARCH模型應用(r_t)
+
+## 1.異質性檢定
+
+### (1)ARCH effect
+
+$H_0:無ARCH效果$，p value極小，拒絕$H_0$，顯示出序列含有ARCH效果，可用ARCH建模
+
+### (2)McLeod Li test
+
+很多lag的p-value顯著小於0.05，表示殘差平方存在自我相關，存在 ARCH 效果
+
+```{r}
+library(FinTS)
+print(McLeod.Li.test(y=r_t))
+print(ArchTest(r_t))
+```
+
+## 2. ARIMA-GARCH模型比較
+
+-   使用先前的ARMA(2,2) for $r_t$ 模型為mean模型、以及ARMA(2,2) for $r_t$中之殘差比較
+
+-   由於先前的QQ凸顯釋出厚尾特徵，在此分配主要使用的是t分配
+
+-   用2025/5/2\~2025/6/13做為測試期間
+
+    ```{r}
+    X2382te <- read_excel("C:\\Users\\Andyfish\\Desktop\\2382te.xlsx") #load data 
+    P_t_te = X2382te$close
+    r_t_te = 100*diff(log(P_t_te)) #複合報酬率 %
+    ```
+
+### (1)GARCH(1,1)
+
+```{r}
+library(rugarch)
+res_arma22 = rt_auto_arima$residuals
+
+spec11 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "sstd"
+)
+
+# 套用模型
+garch_fit11 <- ugarchfit(spec = spec11, data = res_arma22)
+show(garch_fit11)
+
+plot(garch_fit11,which=9)
+plot(garch_fit11,which=10)
+plot(garch_fit11,which=2)
+```
+
+```{r}
+garch_forecast11  <- ugarchforecast(garch_fit11, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast11@forecast$seriesFor), r_t_te)
+print(acc)
+```
+
+### (2)GARCH(1,2)
+
+```{r}
+spec12 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "sstd"
+)
+
+# 套用模型
+garch_fit12 <- ugarchfit(spec = spec12, data = res_arma22)
+show(garch_fit12)
+plot(garch_fit12,which=9)
+plot(garch_fit12,which=10)
+plot(garch_fit12,which=2)
+```
+
+```{r}
+garch_forecast12  <- ugarchforecast(garch_fit12, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast12@forecast$seriesFor), r_t_te)
+print(acc)
+print(Box.test(residuals(garch_fit12),lag=31))
+```
+
+-   在lag31時，殘差序列有顯著自相關，LB test也拒絕
+
+### (3)GARCH(2,1)
+
+```{r}
+spec21 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(2,1)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "sstd"
+)
+
+# 套用模型
+garch_fit21 <- ugarchfit(spec = spec21, data = res_arma22)
+show(garch_fit21)
+plot(garch_fit21,which=9)
+plot(garch_fit21,which=10)
+plot(garch_fit21,which=2)
+```
+
+```{r}
+garch_forecast21  <- ugarchforecast(garch_fit21, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast21@forecast$seriesFor), r_t_te)
+print(acc)
+```
+
+### (4)GARCH(2,2)
+
+```{r}
+spec22 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(2,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "sstd"
+)
+
+# 套用模型
+garch_fit22 <- ugarchfit(spec = spec22, data = res_arma22)
+show(garch_fit22)
+plot(garch_fit22,which=9)
+plot(garch_fit22,which=10)
+plot(garch_fit22,which=2)
+```
+
+```{r}
+garch_forecast22  <- ugarchforecast(garch_fit22, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast22@forecast$seriesFor), r_t_te)
+print(acc)
+```
+
+-   由上面的結果可以得知，用ARMA(2,2)+GARCH(1,2)或(2,2)效果皆良好，QQ圖中大部分的點都在理論分配線上。
+
+-   最簡最適模型為GARCH(1,2)，在樣本外預測結果RMSE為1.771983
+
+-   不過我也發現，在lag31的時候，標準化殘差的ACF仍顯著，可能是外生變數的干擾，導致模型無法抓到那麼後面的序列相關性。
+
+## 3.ARMA及其他ARCH模型比較
+
+-   鑒於上面估計結果中，GARCH order為(1,2)時效果最佳，以下部分類似結構模型也採用(1,2)
+
+-   主要ARMA(2,2)作為mean模型
+
+-   由各模型比較後，我發現ARCH-M模型及MSGARCH(EGARCH+t分配，3狀態)預測效果好
+
+### (0)FI-GARCH\*\*
+
+-   我使用fiGARCH(2,2)作測試，結果RMSE(1.734)、MAE(1.298)下降很多，雖然在標準化殘差ACF圖中，lag=1,24,31顯示出顯著自相關
+-   但在L-B test lag=1,24,31時，在alpha=0.05時，都不拒絕，模型抓時間依賴性很好
+-   QQ圖也很漂亮，大致都在理論分配線上
+
+```{r}
+spec22fi <- ugarchspec(
+  variance.model = list(model = "fiGARCH", garchOrder = c(2,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "std"
+)
+
+# 套用模型
+garch_fit22fi <- ugarchfit(spec = spec22fi, data = res_arma22)
+show(garch_fit22fi)
+plot(garch_fit22fi,which=9)
+plot(garch_fit22fi,which=10)
+plot(garch_fit22fi,which=2)
+
+garch_forecast22fi  <- ugarchforecast(garch_fit22fi, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast22fi@forecast$seriesFor), r_t_te)
+print(acc)
+
+print(Box.test(residuals(garch_fit22fi),lag=1))
+print(Box.test(residuals(garch_fit22fi),lag=24))
+print(Box.test(residuals(garch_fit22fi),lag=31))
+```
+
+### (1)ARCH-M\*
+
+-   在QQ圖大部分都在理論線上，唯獨有些極端值
+
+```{r}
+spec_am <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE, archm = TRUE),
+  distribution.model = "sstd"
+)
+
+am_fit <- ugarchfit(spec_am, data = res_arma22)
+show(am_fit)
+plot(am_fit,which=9)
+plot(am_fit,which=10)
+plot(garch_fit22,which=2)
+
+garch_forecast_am  <- ugarchforecast(am_fit, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast_am@forecast$seriesFor), r_t_te)
+print(acc)
+print(Box.test(residuals(am_fit),lag=31))
+```
+
+### (2)APARCH
+
+-   雖然使用常態分配能獲得較低的RMSE及MAE，但QQ圖並不理想
+
+```{r}
+spec_apg <- ugarchspec(
+  variance.model = list(model = "apARCH", garchOrder = c(1,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "norm" 
+)
+
+apg_fit <- ugarchfit(spec_apg, data = res_arma22)
+show(apg_fit)
+plot(apg_fit,which=9)
+plot(apg_fit,which=10)
+plot(garch_fit22,which=2)
+
+garch_forecast_apg  <- ugarchforecast(apg_fit, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast_apg@forecast$seriesFor), r_t_te)
+print(acc)
+```
+
+### (3)E-GARCH
+
+-   效果普通
+
+```{r}
+spec_eg <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "sstd"  # Student-t 分布（可模擬厚尾）
+)
+
+eg_fit <- ugarchfit(spec_eg, data = res_arma22)
+show(eg_fit)
+plot(eg_fit,which=9)
+plot(eg_fit,which=10)
+plot(garch_fit22,which=2)
+
+garch_forecast_eg  <- ugarchforecast(eg_fit, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast_eg@forecast$seriesFor), r_t_te)
+print(acc)
+```
+
+### (4)GJR-GARCH
+
+-   效果普通
+
+```{r}
+spec_gjr <- ugarchspec(
+  variance.model = list(model = "gjrGARCH", garchOrder = c(1,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "norm"
+)
+
+gjrg_fit <- ugarchfit(spec_gjr, data = res_arma22)
+show(gjrg_fit)
+plot(gjrg_fit,which=9)
+plot(gjrg_fit,which=10)
+plot(garch_fit22,which=2)
+
+garch_forecast_gjr  <- ugarchforecast(gjrg_fit, n.ahead = length(r_t_te))
+# garch_forecast11
+acc = accuracy(as.numeric(garch_forecast_gjr@forecast$seriesFor), r_t_te)
+print(acc)
+```
+
+### (5)Beta-t-E-GARCH
+
+-   無預測報酬率，僅波動率
+
+```{r}
+library(betategarch)
+
+fit_bteg <- tegarch(res_arma22)
+print(summary(fit_bteg))
+forecast_bteg = predict(fit_bteg, n.ahead=length(r_t_te),type="mean")
+print(forecast_bteg)
+```
+
+### (6)MSW-GARCH
+
+-   經反覆測試，我發現用eGARCH+sstd效果好
+
+-   3狀態模型的RMSE輸2狀態模型的RMSE，還算合理，2狀態可以用高波動/低波動、熊/牛市解釋，但3狀態就不好解釋
+
+```{r}
+library(MSGARCH)
+# 2 States
+spec_msw <- CreateSpec(
+  variance.spec = list(model = c("eGARCH")),
+  distribution.spec = list(distribution = c("sstd")),
+  switch.spec = list(K = 2)
+)
+
+fit_msw <- FitML(spec_msw, data = r_t)
+show(fit_msw)
+# 預測
+forecast_msg <- predict(fit_msw, nahead = length(r_t_te),do.return = TRUE)
+predicted_return_msg <- rowMeans(forecast_msg$draw)
+
+acc = accuracy(as.numeric(predicted_return_msg), r_t_te)
+print(acc)
+```
+
+```{r}
+# 3 States
+spec_msw <- CreateSpec(
+  variance.spec = list(model = c("eGARCH")),
+  distribution.spec = list(distribution = c("sstd")),
+  switch.spec = list(K = 3)
+)
+
+fit_msw <- FitML(spec_msw, data = r_t)
+show(fit_msw)
+# 預測
+forecast_msg <- predict(fit_msw, nahead = length(r_t_te),do.return = TRUE)
+predicted_return_msg <- rowMeans(forecast_msg$draw)
+
+acc = accuracy(as.numeric(predicted_return_msg), r_t_te)
+print(acc)
+```
+
+# 三、結構改變與ARMA及GARCH結合應用
+
+## 1.套件估計
+
+### (1)strucchange
+
+-   偵測到5個結構改變點，在578、1488、2051、2614、3191
+
+```{r}
+library(strucchange)
+
+# 假設 r 是資產報酬率
+bp <- breakpoints(r_t ~ 1)
+plot(bp)
+print(summary(bp))
+
+```
+
+```{r}
+bp_points <- environment(bp[["extend.RSS.table"]])[["opt"]]
+print(bp_points)
+```
+
+```{r}
+
+#畫出疊圖
+# 整理資料框
+df_bp_rt <- data.frame(
+  time = 1:length(r_t),
+  r_t = r_t
+)
+df_bp_pt <- data.frame(
+  time = 1:length(P_t),
+  P_t = P_t
+)
+
+# 繪圖：原始資料 + 垂直線標記變點
+p_bp_rt <- ggplot(df_bp_rt, aes(x = time, y = r_t)) +
+  geom_line(color = "steelblue", size = 0.8) +
+  geom_vline(xintercept = bp_points, color = "purple", linetype = "dashed") +
+  labs(title = "報酬率與偵測到的變點",
+       x = "時間",
+       y = "r_t") +
+  theme_minimal()
+
+p_bp_pt <- ggplot(df_bp_pt, aes(x = time, y = P_t)) +
+  geom_line(color = "steelblue", size = 0.8) +
+  geom_vline(xintercept = bp_points, color = "purple", linetype = "dashed") +
+  labs(title = "收盤價與偵測到的變點",
+       x = "時間",
+       y = "P_t") +
+  theme_minimal()
+
+# 互動化
+ggplotly(p_bp_rt)
+ggplotly(p_bp_pt)
+```
+
+### (2)Changepoint
+
+```{r}
+library(changepoint)
+
+# 偵測均值變化（AMOC: At Most One Change）
+res_m <- cpt.mean(r_t, method = "PELT")  # 也可選 "BinSeg", "SegNeigh" 等
+# 同時偵測均值與變異數變化
+res_mv <- cpt.meanvar(r_t, method = "PELT")
+
+# 結果與圖示
+print(cpts(res_m))    # 回傳變點位置
+plot(res_m)
+print(cpts(res_mv))       # 回傳變點位置
+plot(res_mv)
+```
+
+-   偵測到的改變點都太多了，不好分段建模，故下面限制最大改變點數量為10
+
+-   因為SegNeigh方法須自訂penalty，故假設為10\*log(n)--後改為5\*log(n)，原先懲罰太高導致變點過少；n為r_t長度
+
+-   圖例說明: 紅色垂直線為僅偵測平均數的變點，綠色垂直線為偵測平均數及變異數都考量的變點
+
+```{r}
+library(changepoint)
+
+# 偵測均值變化（AMOC: At Most One Change）
+res_m <- cpt.mean(r_t, method = "SegNeigh",Q=10, penalty = "Manual", pen.value = 4 * log(length(r_t)))  # 也可選 "BinSeg", "SegNeigh" 等
+
+# 同時偵測均值與變異數變化
+res_mv <- cpt.meanvar(r_t, method = "SegNeigh",Q=10, penalty = "Manual", pen.value = 4 * log(length(r_t)))
+
+# 結果與圖示
+print(cpts(res_m))       # 回傳變點位置
+# plot(res_m)
+print(cpts(res_mv))       # 回傳變點位置
+# plot(res_mv)
+
+# 繪圖
+p_bp_rt <- ggplot(df_bp_rt, aes(x = time, y = r_t)) +
+  geom_line(color = "steelblue", size = 0.8) +
+  geom_vline(xintercept = cpts(res_m) , color = "red", linetype = "dashed") +
+  geom_vline(xintercept = cpts(res_mv) , color = "green", linetype = "dashed") +
+  labs(title = "報酬率與偵測到的變點",
+       x = "時間",
+       y = "r_t") +
+  theme_minimal()
+
+p_bp_pt <- ggplot(df_bp_pt, aes(x = time, y = P_t)) +
+  geom_line(color = "steelblue", size = 0.8) +
+  geom_vline(xintercept = cpts(res_m) , color = "red", linetype = "dashed") +
+  geom_vline(xintercept = cpts(res_mv) , color = "green", linetype = "dashed") +
+  labs(title = "收盤價與偵測到的變點",
+       x = "時間",
+       y = "P_t") +
+  theme_minimal()
+
+# 互動化
+ggplotly(p_bp_rt)
+ggplotly(p_bp_pt)
+```
+
+### (3)兩者合併
+
+```{r}
+# 繪圖
+p_bp_rt <- ggplot(df_bp_rt, aes(x = time, y = r_t)) +
+  geom_line(color = "steelblue", size = 0.8) +
+  geom_vline(xintercept = cpts(res_m) , color = "red", linetype = "dashed") +
+  geom_vline(xintercept = cpts(res_mv) , color = "green", linetype = "dashed") +
+  geom_vline(xintercept = bp_points, color = "purple", linetype = "dashed") +
+  labs(title = "報酬率與偵測到的變點",
+       x = "時間",
+       y = "r_t") +
+  theme_minimal()
+
+p_bp_pt <- ggplot(df_bp_pt, aes(x = time, y = P_t)) +
+  geom_line(color = "steelblue", size = 0.8) +
+  geom_vline(xintercept = cpts(res_m) , color = "red", linetype = "dashed") +
+  geom_vline(xintercept = cpts(res_mv) , color = "green", linetype = "dashed") +
+  geom_vline(xintercept = bp_points, color = "purple", linetype = "dashed") +
+  labs(title = "收盤價與偵測到的變點",
+       x = "時間",
+       y = "P_t") +
+  theme_minimal()
+
+# 互動化
+ggplotly(p_bp_rt)
+ggplotly(p_bp_pt)
+```
+
+## 2.分段建模
+
+-   由上面合併圖可以看出，在第2紫線及2綠線、在第3紫線及3綠線、在第4紫線及4綠線、第5紫線及5綠線、紅線相近，所以我決定用5段模型建模
+
+-   斷點時間: 取平均
+
+    -   b1: (1488+1588)/2 = 1538
+
+    -   b2: (1958+2051)/2 = 2005
+
+    -   b3: (2458+2617)/2 = 2538
+
+    -   b4: (3259+3268)/2 = 3264
+
+-   建模期間:
+
+    -   p1: 1-1538
+
+    -   p2: 1539-2005
+
+    -   p3: 2006-2538
+
+    -   p4: 2539-3264
+
+    -   p5: 3265-end
+
+```{r}
+period_list = list(1:1538,1539:2005,2006:2538,2539:3264,3265:length(r_t))
+```
+
+### (1)使用ARCH-M
+
+-   我使用ARMA(2,2)做為每一段的mean模型，ARCH-M(1,2)作為條件變異數模型
+
+-   使用該段的下段期間做為測試資料，評估預測準確性
+
+<!-- -->
+
+-   評估結果如下
+
+    | 期間 | RMSE      | MAE       |
+    |------|-----------|-----------|
+    | 1    | 1.64131   | 1.107294  |
+    | 2    | 1.355567  | 0.9292884 |
+    | 3    | 1.515569  | 1.041795  |
+    | 4    | 3.263176# | 2.357894# |
+    | 5    | 1.739621  | 1.355782  |
+
+-   在期間1-3時，股價比較平穩，因此預測的誤差也比較小，比原先用全資料預測樣本外時還準
+
+-   但在期間4、5時，因為股價劇烈波動，導致預測誤差變很大
+
+```{r}
+spec_am <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE, archm = TRUE),
+  distribution.model = "sstd"
+)
+```
+
+```{r}
+# nforcast = 30
+
+#p1
+r_t.arma_am1 <-arma(r_t[period_list[[1]]], order=c(2,2))
+am1_fit <- ugarchfit(spec_am, data =  r_t.arma_am1$residuals[!is.na(r_t.arma_am1$residuals)] )
+# show(am1_fit)
+garch_forecast_am  <- ugarchforecast(am1_fit, n.ahead = length(r_t[period_list[[2]]]))
+acc = accuracy(as.numeric(garch_forecast_am@forecast$seriesFor),r_t[period_list[[2]]])
+print(acc)
+
+#p2
+r_t.arma_am2 <- arma(r_t[period_list[[2]]], order=c(2,2))
+am2_fit <- ugarchfit(spec_am, data =  r_t.arma_am2$residuals[!is.na(r_t.arma_am2$residuals)] )
+# show(am2_fit)
+garch_forecast_am  <- ugarchforecast(am2_fit, n.ahead = length(r_t[period_list[[3]]]))
+acc = accuracy(as.numeric(garch_forecast_am@forecast$seriesFor), r_t[period_list[[3]]])
+print(acc)
+
+#p3
+r_t.arma_am3 <- arma(r_t[period_list[[3]]], order=c(2,2))
+am3_fit <- ugarchfit(spec_am, data =  r_t.arma_am3$residuals[!is.na(r_t.arma_am3$residuals)] )
+# show(am3_fit)
+garch_forecast_am  <- ugarchforecast(am3_fit, n.ahead = length(r_t[period_list[[4]]]))
+acc = accuracy(as.numeric(garch_forecast_am@forecast$seriesFor), r_t[period_list[[4]]])
+print(acc)
+
+
+#p4
+r_t.arma_am4 <- arma(r_t[period_list[[4]]], order=c(2,2))
+am4_fit <- ugarchfit(spec_am, data =  r_t.arma_am4$residuals[!is.na(r_t.arma_am4$residuals)] )
+# show(am4_fit)
+garch_forecast_am  <- ugarchforecast(am4_fit, n.ahead = length(r_t[period_list[[5]]]))
+acc = accuracy(as.numeric(garch_forecast_am@forecast$seriesFor), r_t[period_list[[5]]])
+print(acc)
+
+
+#p5
+r_t.arma_am5 <- arma(r_t[period_list[[5]]], order=c(2,2))
+am5_fit <- ugarchfit(spec_am, data =  r_t.arma_am5$residuals[!is.na(r_t.arma_am5$residuals)] )
+# show(am5_fit)
+garch_forecast_am  <- ugarchforecast(am5_fit, n.ahead =length(r_t_te))
+acc = accuracy(as.numeric(garch_forecast_am@forecast$seriesFor), r_t_te)
+print(acc)
+```
+
+### (2)使用fiGARCH \#
+
+-   只有第一期間成功，剩下一直出現錯誤，只能先擱置
+
+```{r}
+# spec22fi <- ugarchspec(
+#   variance.model = list(model = "fiGARCH", garchOrder = c(2,2)),
+#   mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+#   distribution.model = "std"
+# )
+```
+
+```{r}
+# #p1
+# fi1_fit <- ugarchfit(spec22fi, data =  r_t.arma_am1$residuals[!is.na(r_t.arma_am1$residuals)] )
+# garch_forecast_fi1  <- ugarchforecast(fi1_fit, n.ahead = length(r_t[period_list[[2]]]))
+# acc = accuracy(as.numeric(garch_forecast_fi1@forecast$seriesFor),r_t[period_list[[2]]])
+# print(acc)
+# 
+# # p2
+# fi2_fit <- ugarchfit(spec22fi, data = r_t.arma_am2$residuals[!is.na(r_t.arma_am2$residuals)])
+# garch_forecast_fi2 <- ugarchforecast(fi2_fit, n.ahead = length(r_t[period_list[[3]]]))
+# acc <- accuracy(as.numeric(garch_forecast_fi2@forecast$seriesFor), r_t[period_list[[3]]])
+# print(acc)
+# 
+# # ugarchforecast(fi2_fit, n.ahead = 10)
+# 
+# # p3
+# fi3_fit <- ugarchfit(spec22fi, data = r_t.arma_am3$residuals[!is.na(r_t.arma_am3$residuals)])
+# garch_forecast_fi3 <- ugarchforecast(fi3_fit, n.ahead = length(r_t[period_list[[4]]]))
+# acc <- accuracy(as.numeric(garch_forecast_fi3@forecast$seriesFor), r_t[period_list[[4]]])
+# print(acc)
+# 
+# # p4
+# fi4_fit <- ugarchfit(spec22fi, data = r_t.arma_am4$residuals[!is.na(r_t.arma_am4$residuals)])
+# garch_forecast_fi4 <- ugarchforecast(fi4_fit, n.ahead = length(r_t[period_list[[5]]]))
+# acc <- accuracy(as.numeric(garch_forecast_fi4@forecast$seriesFor), r_t[period_list[[5]]])
+# print(acc)
+# 
+# # p5（假設樣本外資料為 r_t_te）
+# fi5_fit <- ugarchfit(spec22fi, data = r_t.arma_am5$residuals[!is.na(r_t.arma_am5$residuals)])
+# garch_forecast_fi5 <- ugarchforecast(fi5_fit, n.ahead = length(r_t_te))
+# acc <- accuracy(as.numeric(garch_forecast_fi5@forecast$seriesFor), r_t_te)
+# print(acc)
+
+```
+
+# 四、其他模型及其預測評估
+
+### 1.Prophet
+
+-   Prophet 為一種時間序列資料設計的可解釋、可自動化的預測模型，適合有季節性與假期效應的資料
+
+-   基本理論: y(t)=g(t)+s(t)+h(t)+εt，g(t)為趨勢項、s(t)為季節項、h(t)為假日效應、εt為殘差
+
+-   特色:
+
+    -   自動建模趨勢與季節性: 內建加法或乘法結構
+
+    -   支援變動趨勢轉折點(結構改變): 自動偵測轉折（如轉熊轉牛）
+
+    -   可加入假期與事件資訊: 提高特殊日期預測準確度
+
+    -   易於操作與視覺化: 只需提供時間與值欄位即可分析
+
+-   報酬率的預測能力很不錯，RMSE: 1.62337,MAE: 1.030197
+
+```{r}
+#V2 forecast
+library(foreach)
+library(dplyr)
+library(reshape2)
+library(prophet)
+library(furrr)
+
+X2382te$ymd = as.Date(X2382te$ymd,"%Y%m%d")
+mtm_c = rbind(X2382[c("ymd","close")],X2382te[c("ymd","close")])
+colnames(mtm_c) = c("ds","y")
+mtm_c$ds = as.Date(mtm_c$ds,"%Y%m%d")
+
+dates <- seq(as.Date("2010-01-04"), by = "day", length.out = 365*15+5*30+15)
+mtm_cf = data.frame()
+mtm_cf <- data.frame("ds" = dates,"y"=rep(0,length(dates)))
+
+mtm_cf = merge(mtm_c,mtm_cf,by="ds",all.y = TRUE)
+mtm_cf = mtm_cf[,-3]
+colnames(mtm_cf) = c("ds","y")
+
+for (i in 1:nrow(mtm_cf))
+{
+  if (is.na(mtm_cf[1,"y"])){mtm_cf[1,"y"]=0}
+  #若無對應值
+  if (is.na(mtm_cf[i,"y"]) && i!=1)
+  {
+    lag1 = i-1
+    mtm_cf[i,"y"] = mtm_cf[lag1,"y"]
+  }
+}
+mtm_cf = mtm_cf[c(-1:-3),]
+rownames(mtm_cf) = NULL
+#----------------------------------
+ini_time = Sys.time()
+plan(multisession)
+
+w_size <- 5593
+n_windows <- nrow(mtm_cf) - w_size  # 你自己決定的視窗數
+
+# 定義平行函數
+run_one_prophet <- function(i) {
+  mtm_in <- mtm_cf[i:(w_size + i - 1), c("ds", "y")]
+  m <- prophet(mtm_in)
+  future <- make_future_dataframe(m, periods = 1)
+  forecast <- predict(m, future)
+  
+  f1 <- forecast[w_size + 1,'yhat']
+  f0 <- mtm_cf[w_size + i,"y"]
+  date <- as.Date(mtm_cf[w_size + i,"ds"])
+  
+  data.frame(ds = date, r = f0, f = f1)
+  # print(i)
+}
+
+# 平行執行
+prophet_forecasts <- future_map_dfr(1:n_windows, run_one_prophet,.options = furrr_options(seed = TRUE))
+cat("執行時間: ",Sys.time()-ini_time)
+
+# library(writexl)
+# write_xlsx(prophet_forecasts, "res.xlsx")
+
+print(accuracy(100*diff(log(prophet_forecasts$r)),100*diff(log(prophet_forecasts$f))))
+```
+
+### 2.Chronos T5 large
+
+-   Chronos-T5 (Large) 模型為一款基於語言模型架構的預訓練時間序列預測模型。此模型系列的目標是學習時間序列的“語言”，通過將時間序列資料轉化為序列化的token，利用語言模型進行訓練和預測
+
+-   **概念:** 此模型核心原理是將時間序列資料轉換為token序列，然後利用基於T5架構的語言模型對這些token進行訓練。具體過程如下：
+
+    -   數據預處理：將時間序列資料通過縮放和量化轉換為token序列
+
+    -   模型訓練：使用交叉熵損失函數在token序列上訓練語言模型
+
+    -   預測：在推斷階段，模型會自動回歸地採樣token，並將它們映射回原數值，通過多次採樣來預測
+
+-   **特色**
+
+    -   性能優勢：在多種時間序列預測任務中表現優異，能夠生成準確且多樣化的預測軌跡
+
+    -   靈活的模型大小：提供了不同大小的模型，從小型Chronos-T5-tiny到功能強大的Chronos-T5-large，滿足不同計算資源和性能需求
+
+    -   預訓練和微調：模型已經在大規模時間序列資料上進行了預訓練，可以直接用於推斷或根據特定任務進行微調
+
+-   因為此模型是基於機率的預測(就像問ChatGPT同樣問題，每次有不同回答一樣)，不像ARIMA等模型有固定的結果，所以我在python運行100次，每次進行20輪的預測。經比較後，得到中位數RMSE為1.7954550154911448，MAE為1.3412276055515768，表現不錯，此模型較能預測出波動，後續會有圖片說明。我後面也會使用Dynamic Time Warping (DTW)進行綜合評估
+
+-   下面是我使用的python code
+
+```{python}
+# import matplotlib.pyplot as plt
+# import numpy as np
+# import pandas as pd
+# import torch
+# from chronos import ChronosPipeline
+# 
+# pipeline = ChronosPipeline.from_pretrained(
+#   "amazon/chronos-t5-large",
+#   device_map="cuda",
+#   torch_dtype=torch.bfloat16,
+# )
+# from dtaidistance import dtw
+# from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+# 
+# df = pd.concat([pd.read_excel(r"C:\Users\Andyfish\Desktop\2382.xlsx"),pd.read_excel(r"C:\Users\Andyfish\Desktop\2382te.xlsx")])
+# df.reset_index(inplace=True, drop=True)
+# 
+# w_size  = 3755
+# n_windows =  len(df) - w_size  # 你自己決定的視窗數
+# df_forecast = pd.DataFrame()
+# df_metrics = pd.DataFrame()
+# 
+# df_results = pd.DataFrame(columns=["f","r"])
+# for o in range(100):
+#     df_forecast = pd.DataFrame()
+#     for i in range(n_windows-1):
+#         if df_forecast.empty:
+#             context = torch.tensor(df.loc[i:w_size,"close"].values)
+#         else:
+#             context = torch.tensor(np.concatenate([df.loc[i:w_size,"close"].values , df_forecast.loc[0:i,"f"].values]))
+#         forecast = pipeline.predict(context, 1)  
+#         df_forecast.loc[i,"f"] = float(forecast[0].median(dim=0).values)
+#         df_forecast.loc[i,"r"] = df.loc[w_size+i+1,"close"]
+#          
+#         # print(forecast[0].median(dim=0).values,df.loc[w_size+i+1,"close"],df.loc[w_size+i+1,"ymd"])
+#     df_results.loc[o,"f"] = list(df_forecast.loc[:,"f"])
+#     
+#     log_ret_f = 100*np.diff(np.log(df_forecast['f']))
+#     log_ret_r = 100*np.diff(np.log(df_forecast['r']))
+#     distance = dtw.distance(log_ret_r, log_ret_f)
+#     print(f"RMSE: {root_mean_squared_error(log_ret_f, log_ret_r)},MAE: {mean_absolute_error(log_ret_f, log_ret_r)}, DTW distance: {distance}" )
+# 
+#     df_metrics.loc[o,"RMSE"] = root_mean_squared_error(log_ret_f, log_ret_r)
+#     df_metrics.loc[o,"MAE"] = mean_absolute_error(log_ret_f, log_ret_r)
+#     df_metrics.loc[o,"DTW"] = distance
+# 
+# df_results.loc[0,"r"] = list(df_forecast.loc[:,"r"])
+
+# import pandas as pd
+# import plotly.graph_objects as go
+# 
+# # 假設 df 已經存在，且格式如描述
+# fig = go.Figure()
+# df = df_results
+# 
+# # 1️⃣ 畫實際價格線（只在 df.iloc[0]['r'] 有資料）
+# real_price = df.iloc[0]['r']
+# fig.add_trace(go.Scatter(
+#     y=real_price,
+#     mode='lines',
+#     name='實際價格',
+#     line=dict(color='black', width=3)
+# ))
+# 
+# # 2️⃣ 畫預測價格線（每一列的 f 都是一個 list）
+# for i in range(len(df)):
+#     predicted = df.iloc[i]['f']
+#     fig.add_trace(go.Scatter(
+#         y=predicted,
+#         mode='lines',
+#         name=f'預測 {i+1}',
+#         line=dict(color='blue', width=1),
+#         opacity=0.3,
+#         showlegend=False  # 不顯示每條預測線的圖例
+#     ))
+# 
+# # 3️⃣ 美化圖表
+# fig.update_layout(
+#     title='實際價格與預測價格線',
+#     xaxis_title='時間',
+#     yaxis_title='價格',
+#     template='plotly_white',
+#     showlegend=True
+# )
+# 
+# import plotly.express as px
+# 
+# print(f"RMSE median: {df_metrics.loc[:,'RMSE'].median()}")
+# print(f"MAE median: {df_metrics.loc[:,'MAE'].median()}")
+# print(f"DTW median: {df_metrics.loc[:,'DTW'].median()}")
+# 
+# df = df_metrics.copy()
+# 
+# fig_rmse = px.histogram(df, x='RMSE', nbins=30, title='RMSE 分布直方圖')
+# fig_mae  = px.histogram(df, x='MAE',  nbins=30, title='MAE 分布直方圖')
+# fig_dtw  = px.histogram(df, x='DTW',  nbins=30, title='DTW 分布直方圖')
+# 
+# fig_rmse.show()
+# fig_mae.show()
+# fig_dtw.show()
+```
+
+### 3.DCC-GARCH \#
+
+-   多變量時間序列模型，用來捕捉不同資產**報酬率之間的變動關聯性**（相關係數）**會隨時間改變**的現象
+
+-   適合應用在風險管理、資產配置、避險等領域
+
+-   概念:
+
+    -   將波動性與相關性分開建模，讓相關性隨時間變化
+
+    -   擴展性好、計算效率高、適用多資產
+
+-   由於此處僅先用單一資產分析，且來不及做完，未來可以加入多資產配置來用此模型分析
+
+# 五、總結-以預測準確性評估
+
+```{r}
+P_t_combined = mtm_c$y
+r_t_combined = 100*diff(log(P_t_combined)) #複合報酬率 %
+
+chronos_res <- read_excel("C:\\Users\\Andyfish\\Desktop\\df_forecast_chronos.xlsx")
+chronos_res$ds = as.Date(chronos_res$ds,"%Y%m%d")
+```
+
+## 1.ARMA(2,2)+GARCH(1,2)
+
+-   用普通的ARMA+GARCH，預測能力較為一般
+-   報酬率RMSE: 1.997864,MAE: 1.466457, DTW:44.4717
+-   價格RMSE: 33.45346,MAE: 31.49488,DTW: 1211.424
+
+```{r}
+library(foreach)
+library(doParallel)
+num_cores <- parallel::detectCores() - 1
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+w_size = 3755
+n_windows = length(r_t_combined) - w_size
+
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "sstd"
+)
+
+a22g12_results <- foreach(i = 1:n_windows, .combine = rbind,
+                   .packages = c("rugarch")) %dopar% {
+  r_t_in = r_t_combined[i:(w_size + i - 1)]
+  actual_val = r_t_combined[w_size + i]
+
+  tryCatch({
+    fit <- ugarchfit(spec, data = r_t_in, solver = "hybrid", silent = TRUE)
+    fc <- ugarchforecast(fit, n.ahead = 1)
+    pred <- as.numeric(fc@forecast$seriesFor[1])
+    return(data.frame(pred = pred, actual = actual_val))
+  }, error = function(e) {
+    return(data.frame(pred = NA, actual = actual_val))
+  })
+                   }
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+```{r}
+cat("Return acc ",accuracy(a22g12_results$pred,a22g12_results$actual),"\n")
+cat("Return DTW ",dtw(a22g12_results$pred,a22g12_results$actual)$distance)
+```
+
+```{r}
+a22g12_res = data.frame(ds = mtm_c$ds[3757:3786] ,r = a22g12_results$actual, f = a22g12_results$pred)
+a22g12_res_p = data.frame(ds = a22g12_res$ds)
+
+m_close = matrix(0,n_windows,2)
+a=0
+for (a in 1:n_windows)
+{
+  if (a==1){
+    m_close[a,1] = as.numeric(mtm_c[3756,"y"])*(1+a22g12_results$pred[a]/100)
+    m_close[a,2] = as.numeric(mtm_c[3757,"y"])
+  }else{
+    m_close[a,1] = m_close[a-1,1]*(1+a22g12_results$pred[a]/100)
+    m_close[a,2] = as.numeric(mtm_c[3757+a-1,"y"])
+  }
+}
+a22g12_res_p = cbind(a22g12_res,m_close)
+a22g12_res_p = a22g12_res_p[c(1,5,4)]
+colnames(a22g12_res_p) = c("ds","r","f")
+
+pf_long = melt(a22g12_res_p,id.vars = "ds")
+p_a22g12 <- pf_long %>%
+  ggplot( aes(x = ds, y = value, color = variable, linetype = variable)) +
+  geom_line(size = 1) +
+  labs(title = "Forecasts vs Actual",
+       x = "Date", y = "P_t") +
+  theme_minimal()
+
+cat("Price acc ",accuracy(a22g12_res_p$r,a22g12_res_p$f),"\n")
+cat("Price DTW ",dtw(a22g12_res_p$r,a22g12_res_p$f)$distance)
+p_a22g12 <- ggplotly(p_a22g12)
+p_a22g12
+```
+
+## 2.ARMA+ARCH-M
+
+-   用ARMA+ARCH-M，預測能力稍好一些
+-   報酬率RMSE: 1.951482 ,MAE: 1.432302, DTW: 44.08245
+-   價格RMSE: 31.44972 ,MAE: 29.67159, DTW: 1064.527
+-   趨勢也有慢慢往上的跡象，不像上面用普通GARCH，連趨勢都沒有出來
+
+```{r}
+w_size = 3755
+n_windows = length(r_t_combined) - w_size
+
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE, archm = TRUE),
+  distribution.model = "sstd"
+)
+
+a22g12m_results <- foreach(i = 1:n_windows, .combine = rbind,
+                   .packages = c("rugarch")) %dopar% {
+  r_t_in = r_t_combined[i:(w_size + i - 1)]
+  actual_val = r_t_combined[w_size + i]
+
+  tryCatch({
+    fit <- ugarchfit(spec, data = r_t_in, solver = "hybrid", silent = TRUE)
+    fc <- ugarchforecast(fit, n.ahead = 1)
+    pred <- as.numeric(fc@forecast$seriesFor[1])
+    return(data.frame(pred = pred, actual = actual_val))
+  }, error = function(e) {
+    return(data.frame(pred = NA, actual = actual_val))
+  })
+}
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+```{r}
+cat("Return acc ",accuracy(a22g12m_results$pred,a22g12m_results$actual),"\n")
+cat("Return DTW ",dtw(a22g12m_results$pred,a22g12m_results$actual)$distance)
+```
+
+```{r}
+a22g12m_res = data.frame(ds = mtm_c$ds[3757:3786] ,r = a22g12m_results$actual, f = a22g12m_results$pred)
+a22g12m_res_p = data.frame(ds = a22g12m_res$ds)
+
+m_close = matrix(0,n_windows,2)
+a=0
+for (a in 1:n_windows)
+{
+  if (a==1){
+    m_close[a,1] = as.numeric(mtm_c[3756,"y"])*(1+a22g12m_results$pred[a]/100)
+    m_close[a,2] = as.numeric(mtm_c[3757,"y"])
+  }else{
+    m_close[a,1] = m_close[a-1,1]*(1+a22g12m_results$pred[a]/100)
+    m_close[a,2] = as.numeric(mtm_c[3757+a-1,"y"])
+  }
+}
+a22g12m_res_p = cbind(a22g12m_res,m_close)
+a22g12m_res_p = a22g12m_res_p[c(1,5,4)]
+colnames(a22g12m_res_p) = c("ds","r","f")
+
+pf_long = melt(a22g12m_res_p,id.vars = "ds")
+p_a22g12m <- pf_long %>%
+  ggplot( aes(x = ds, y = value, color = variable, linetype = variable)) +
+  geom_line(size = 1) +
+  labs(title = "Forecasts vs Actual",
+       x = "Date", y = "P_t") +
+  theme_minimal()
+
+cat("Price acc ",accuracy(a22g12m_res_p$r,a22g12m_res_p$f),"\n")
+cat("Price DTW ",dtw(a22g12m_res_p$r,a22g12m_res_p$f)$distance)
+p_a22g12m <- ggplotly(p_a22g12m)
+p_a22g12m
+```
+
+## 3.ARMA+fiGARCH
+
+-   用ARMA+fiGARCH，預測能力略輸ARCH-M
+-   報酬率RMSE: 1.96025 ,MAE: 1.445839, DTW: 44.66941
+-   價格RMSE: 31.91908 ,MAE: 30.04877, DTW: 1109.221
+-   用fiGARCH，趨勢雖然不明顯，但波動有稍為反映出來一些
+
+```{r}
+# fiGARCH版本的滾動窗口預測
+w_size = 3755
+n_windows = length(r_t_combined) - w_size
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# 使用fiGARCH規格設定
+spec22fi <- ugarchspec(
+  variance.model = list(model = "fiGARCH", garchOrder = c(2,2)),
+  mean.model = list(armaOrder = c(2,2), include.mean = FALSE),
+  distribution.model = "std"
+)
+```
+
+```{r}
+# 執行滾動窗口預測
+a22fi_results <- foreach(i = 1:n_windows, .combine = rbind,.packages = c("rugarch")) %dopar% {
+  r_t_in = r_t_combined[i:(w_size + i - 1)]
+  actual_val = r_t_combined[w_size + i]
+  tryCatch({
+    fit <- ugarchfit(spec22fi, data = r_t_in, solver = "hybrid", silent = TRUE)
+    fc <- ugarchforecast(fit, n.ahead = 1)
+    pred <- as.numeric(fc@forecast$seriesFor[1])
+    return(data.frame(pred = pred, actual = actual_val))
+  }, error = function(e) {
+    return(data.frame(pred = NA, actual = actual_val))
+  })
+}
+
+stopCluster(cl)
+registerDoSEQ()
+
+# 計算報酬率預測準確度
+cat("Return acc ", accuracy(a22fi_results$pred, a22fi_results$actual), "\n")
+cat("Return DTW ", dtw(a22fi_results$pred, a22fi_results$actual)$distance, "\n")
+```
+
+```{r}
+# 準備價格預測資料
+a22fi_res = data.frame(ds = mtm_c$ds[3757:3786], r = a22fi_results$actual, f = a22fi_results$pred)
+a22fi_res_p = data.frame(ds = a22fi_res$ds)
+m_close = matrix(0, n_windows, 2)
+a = 0
+
+# 計算價格預測
+for (a in 1:n_windows) {
+  if (a == 1) {
+    m_close[a, 1] = as.numeric(mtm_c[3756, "y"]) * (1 + a22fi_results$pred[a]/100)
+    m_close[a, 2] = as.numeric(mtm_c[3757, "y"])
+  } else {
+    m_close[a, 1] = m_close[a-1, 1] * (1 + a22fi_results$pred[a]/100)
+    m_close[a, 2] = as.numeric(mtm_c[3757+a-1, "y"])
+  }
+}
+
+# 整理價格預測結果
+a22fi_res_p = cbind(a22fi_res, m_close)
+a22fi_res_p = a22fi_res_p[c(1, 5, 4)]
+colnames(a22fi_res_p) = c("ds", "r", "f")
+
+# 繪製圖表
+pf_long = melt(a22fi_res_p, id.vars = "ds")
+p_a22fi <- pf_long %>%
+  ggplot(aes(x = ds, y = value, color = variable, linetype = variable)) +
+  geom_line(size = 1) +
+  labs(title = "fiGARCH Forecasts vs Actual",
+       x = "Date", y = "P_t") +
+  theme_minimal()
+
+# 計算價格預測準確度
+cat("Price acc ", accuracy(a22fi_res_p$r, a22fi_res_p$f), "\n")
+cat("Price DTW ", dtw(a22fi_res_p$r, a22fi_res_p$f)$distance, "\n")
+# 顯示互動式圖表
+p_a22fi <- ggplotly(p_a22fi)
+p_a22fi
+```
+
+## 4.Prophet
+
+-   用Prophet，價格預測能力說實在不太好，但報酬率部分不錯
+-   價格RMSE: 52.41119 ,MAE: 51.67237 , DTW: 3408.985
+-   價格方面:儘管趨勢預測是正確的，但與實際價格差距很大，比我想像中還要差很多
+-   但報酬率方面算很不錯的
+
+```{r}
+library(ggplot2)
+library(plotly)
+library(hrbrthemes)
+library(dplyr)
+library(dtwclust)
+
+ret_ph_r = 100*diff(log(prophet_forecasts$r))
+ret_ph_f = 100*diff(log(prophet_forecasts$f))
+
+pf_long = melt(prophet_forecasts,id.vars = "ds")
+p2 <- pf_long %>%
+  ggplot( aes(x = ds, y = value, color = variable, linetype = variable)) +
+  geom_line(size = 1) +
+  labs(title = "Forecasts vs Actual",
+       x = "Date", y = "P_t") +
+  theme_minimal()
+
+cat("Return acc ",accuracy(ret_ph_r,ret_ph_f),"\n")
+cat("Return DTW ",dtw(ret_ph_r,ret_ph_f)$distance,"\n")
+cat("Price acc ",accuracy(prophet_forecasts$r,prophet_forecasts$f),"\n")
+cat("Price DTW ",dtw(prophet_forecasts$r,prophet_forecasts$f)$distance)
+
+p2 <- ggplotly(p2)
+p2
+```
+
+## 5.Chronos T5 large
+
+-   用Chronos T5 large，預測能力很好，甚至超越上面的ARCH-M很多
+-   中位數報酬率RMSE: 1.7954550154911448,MAE: 1.3412276055515768 , DTW: 37.39908
+-   中位數價格RMSE: 29.95182 ,MAE: 28.17033 , DTW: 936.3612
+-   從下面圖片可以看出來，無論是在預測波動還是趨勢，表現都相當不錯
+-   這個模型的表現相當優秀，最開始只是在HuggingFace上面看到很多人下載而已，沒想到這個底層架構是靠語言模型的時間序列模型，在預測方面完全不輸ARIMA+GARCH等方案，並且有支援CUDA GPU加速、模型不會太大、易用等優點。我認為，雖然這種依賴深度學習的黑箱模型，雖然沒有相關的理論基礎去建構它的底層邏輯(不像是ARIMA這麼簡潔明瞭，由自回歸項、MA項、integrated(i)項構成，各自都有堅實的理論支撐)，但是單論chronos t5的預測能力而言，確實引人注目。
+-   儘管如此，此模型每一次預測的結果都不相同，這可能會加深模型風險，為風險管理帶來挑戰。下面我把所有模型預測的路線全部畫上去，可見其雖然大部分預測都集中，但仍有離群值，在進行預測時需格外小心。
+
+```{r}
+chr_metrics = data.frame()
+chr_res_last_r = data.frame(matrix(nrow = 29,ncol = 0))
+chr_res_last <- read_excel("C:/Users/Andyfish/Desktop/TSA/chr_res_last.xlsx")
+#For price
+for (i in 1:100){
+  chr_metrics[i,"RMSE"] = accuracy( as.numeric(unlist(chr_res_last[,i+1]))  , as.numeric(unlist(chr_res_last["r"])) )[2]
+  chr_metrics[i,"MAE"] = accuracy( as.numeric(unlist(chr_res_last[,i+1]) ), as.numeric(unlist(chr_res_last["r"])) )[3]
+  chr_metrics[i,"DTW"] = dtw(chr_res_last[i+1],chr_res_last["r"])$distance
+}
+print(median(as.numeric(unlist(chr_metrics["RMSE"]))))
+print(median(as.numeric(unlist(chr_metrics["MAE"]))))
+print(median(as.numeric(unlist(chr_metrics["DTW"]))))
+cat("\n")
+
+#For return
+for (i in 1:101){
+  chr_res_last_r[,i] = 100*diff(log(as.numeric(unlist(chr_res_last[,i+1]))))
+}
+
+for (i in 1:100){
+  chr_metrics[i,"RMSE"] = accuracy( as.numeric(unlist(chr_res_last_r[,i+1]))  , as.numeric(unlist(chr_res_last_r[101])) )[2]
+  chr_metrics[i,"MAE"] = accuracy( as.numeric(unlist(chr_res_last_r[,i+1]) ), as.numeric(unlist(chr_res_last_r[101])) )[3]
+  chr_metrics[i,"DTW"] = dtw(chr_res_last_r[i+1],chr_res_last_r[101])$distance
+}
+
+print(median(as.numeric(unlist(chr_metrics["RMSE"]))))
+print(median(as.numeric(unlist(chr_metrics["MAE"]))))
+print(median(as.numeric(unlist(chr_metrics["DTW"]))))
+```
+
+-   ![](Chrnos_forecasts_res.png)
+-   ![](chrnos_RMSE.png)
+-   ![](chrnos_MAE.png)
+
+## 6.附: 本學期心得
+
+在這個學期中，我了解到了很多的時間序列模型、分析檢定方法，以及其背後的原理與理論背景。但坦白說，儘管我已經閱讀完教授的上課筆記，但是有些地方還是不太清楚，這方面除了我自身能力不足以外，我認為中興財金的數理課程設計還有些待改進的地方:系上數理相關的課程僅有微積分這種講得比較深入、收穫較多；但是在大二的統計學卻和行銷、企管等較不需進階統計的科系一起上課，導致課程為了因應各科系，難度較低(大概像只有基礎離散、連續分配簡介，平均數檢定、ANOVA、簡單回歸等基礎內容)，使得之後像基礎計量經濟學等課程就開始有些吃力(因為需進階的數理推導)。如果財金系有另開財務統計概論，專門補足這部分的不足，那之後學生們肯定會比較輕鬆應對。
+
+但總的來說，從AR、MA、ARMA、ARIMA、ARCH、GARCH等模型都相當有趣，之前只有聽過而未實做過，在這門課程終於能夠理解其底層邏輯及實操，對於之後分析時間序列資料肯定會變得更得心應手。
+
+另外，在我做這個報告的過程，我發現R語言雖然在計算效率上非常高，跟C語言差不多，但是在很多地方的資料操作卻不像python那樣靈活好用，導致我花費很多時間在DEBUG，在python中，同樣也有非常多統計與時間序列分析套件，且生態完整。甚至現在很多主流的機器學習/深度學習套件都有支援python及CUDA加速，我認為使用python和R各有其優勢與劣勢，但我用python會比較順手一些、效率更高，算是意外中的發現。
+
+# 六、附: Lobato test(期中)
+
+## Full code
+
+```{r,include=TRUE}
+library(readxl)
+X2382 <- read_excel("C:\\Users\\Andyfish\\Desktop\\2382.xlsx") #load data 
+y <- X2382$close
+
+lobato_test = function(y,p)
+{
+  n = length(y)         
+  np = n-p
+  y_t_bar = mean(y)
+  y_c = y - y_t_bar     # centered y
+  
+  S_t = matrix(0,np,p)  #Initialize S_t
+  cv = c(0)             #c vector for sample autocovariances
+  for (coli in 1:p)
+  {
+    #load y_c[i,j] to calculate sample autocovariances
+    for (rowi in 1:np) {S_t[rowi,coli] = (y_c[(p+1)+(rowi-1)] * y_c[coli+(rowi-1)])[1]} 
+    cv[coli] = colMeans(S_t)[coli]                #Storing means
+    S_t[,coli] = S_t[,coli] - colMeans(S_t)[coli] #demean by column
+    S_t[,coli] = cumsum(S_t[,coli])               #cum.sum. by column
+  }
+  
+  Inv_C_K <- solve((t(S_t) %*% S_t) / (np^2)) #C_K^-1
+  T_k <- np * t(cv) %*% Inv_C_K %*% cv        #T_k
+  crit95p <- c(45.4, 103.6, 174.8, 259.3,356.5, 465.9, 587.9, 719.4, 865.1, 1020, 1186, 1365, 1550, 1751, 1957, 2182, 2420, 2661, 2909, 3171) 
+  rej_zone <- (T_k >= crit95p[p])
+  return(list(LB=T_k, Critical.Value = crit95p[p], Rejection=rej_zone))
+}
+
+print(lobato_test(y,1))
+```
+
+## 解釋
+
+### 1.載入資料
+
+```{r}
+library(readxl)
+X2382 <- read_excel("C:\\Users\\Andyfish\\Desktop\\2382.xlsx") #load data 
+y <- X2382$close
+```
+
+### 2.設樣本長度為n，
+
+$\bar{y_t} = E(y)$，中心化的y為$y^c=(y_t-\bar{y_t})$，np為樣本個數減去lag期數p。
+
+同時建立(np x p)的矩陣$S_t$，cv為樣本自共變異數向量。
+
+```{r}
+  p=1#假設
+  n = length(y)         
+  np = n-p
+  y_t_bar = mean(y)
+  y_c = y - y_t_bar     # centered y
+  
+  S_t = matrix(0,np,p)  #Initialize S_t
+  cv = c(0)             #c vector for sample autocovariances
+```
+
+### 3.計算$S_t$矩陣。
+
+(3-1)其中外層for迴圈控制每行的索引，內層for迴圈控制列的索引，利用矩陣內每個元素是$第[(p+1)+(列索引-1)]個y_c * 第[行索引+(列索引-1)]個y_c$的性質做帶入的動作。
+
+舉例來說，若$p=1,np=n-1$，會產生如下的$(n-1)*1$矩陣: $$
+S_t = 
+\begin{bmatrix}
+y_2^cy_1^c \\
+y_3^cy_2^c \\
+...\\
+y_{n}^cy_{n-1}^c
+\end{bmatrix}
+$$
+
+若$p=2,np=n-2$，會產生如下的$(n-2)*2$矩陣: $$
+S_t = 
+\begin{bmatrix}
+y_3^cy_1^c & y_3^cy_2^c \\
+y_4^cy_2^c & y_4^cy_3^c\\
+... & ...\\
+y_{n}^cy_{n-2}^c &  y_{n}^cy_{n-1}^c
+\end{bmatrix}
+$$
+
+(3-2)在初步儲存完$y_c$後，先以colMeans函式求得行平均值，從$S_t$矩陣該行各元素扣除，後再將該行以cumsum累加，最終求得完整的$S_t$。cv是各行的平均值組成之向量。
+
+```{r}
+  p=1#假設
+  for (coli in 1:p)
+  {
+    #load y_c[i,j] to calculate sample autocovariances
+    for (rowi in 1:np) {S_t[rowi,coli] = (y_c[(p+1)+(rowi-1)] * y_c[coli+(rowi-1)])[1]} 
+    cv[coli] = colMeans(S_t)[coli]                #Storing means
+    S_t[,coli] = S_t[,coli] - colMeans(S_t)[coli] #demean by column
+    S_t[,coli] = cumsum(S_t[,coli])               #cum.sum. by column
+  }
+```
+
+### 4.檢定統計量
+
+$T_k=Tc`C_kc \to U_K$。用上部分得出之$S_t$算出$C_K=S_tS_t`/T$，再將其用solve函式作反矩陣$C_K^{-1}$。最後再將也是由上部分獲得的cv向量與T(也就是np)相乘，得出最終統計量。
+
+然後以預先知道的5%拒絕域臨界值做一向量crit95p，依據p(lag)的不同而選擇合適的數值，並與$T_k$做比較，看是否為拒絕或不拒絕，回傳結果。
+
+```{r}
+  Inv_C_K <- solve((t(S_t) %*% S_t) / (np^2)) #C_K^-1
+  T_k <- np * t(cv) %*% Inv_C_K %*% cv        #T_k
+  crit95p <- c(45.4, 103.6, 174.8, 259.3,356.5, 465.9, 587.9, 719.4, 865.1, 1020, 1186, 1365, 1550, 1751, 1957, 2182, 2420, 2661, 2909, 3171) 
+  rej_zone <- (T_k >= crit95p[p])
+  print(list(LB=T_k, Critical.Value = crit95p[p], Rejection=rej_zone)) #原為return
+```
+
+### 5.執行函式並取得結果
+
+```{r}
+print(lobato_test(y,1))
+```
